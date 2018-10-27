@@ -2,61 +2,63 @@ extern crate gstreamer;
 extern crate glib;
 use gstreamer as gst;
 use gstreamer::{DeviceMonitor, DeviceMonitorExt, DeviceExt, ElementExt, BinExtManual};
-use std::{u64, fmt, thread, time};
+use gstreamer::{Fraction, FractionRange, List, IntRange};
+use gstreamer::caps::{Builder, Caps};
+use std::{i32, fmt, thread, time};
 
 enum Constrain<T> {
     Value(T),
     Range(ConstrainRange<T>)
 }
 
-impl<T: Constrainable> Constrain<T> {
-    fn into_caps_string(self, min: &str, max: &str) -> Option<String> {
+impl Constrain<u64> {
+    fn add_to_caps(self, name: &str, min: u64, max: u64, builder: Builder) -> Option<Builder> {
         match self {
-            Constrain::Value(v) => Some(format!("{}{}", T::PREFIX, v.into_caps_string()?)),
+            Constrain::Value(v) => Some(builder.field(name, &(v as i64 as i32))),
             Constrain::Range(r) => {
-                let (t_min, t_max);
-                let min = if let Some(m) = r.min {
-                    t_min = m.into_caps_string();
-                    t_min.as_ref().map(|t| &**t).unwrap_or(min)
-                } else { min };
-                let max = if let Some(m) = r.max {
-                    t_max = m.into_caps_string();
-                    t_max.as_ref().map(|t| &**t).unwrap_or(max)
-                } else { max };
-                if let Some(ideal) = r.ideal.and_then(|i| i.into_caps_string()) {
-                    Some(format!("{}{{ {}, [{}, {}] }}",T::PREFIX, ideal, min, max))
+                let min = into_i32(r.min.unwrap_or(min));
+                let max = into_i32(r.max.unwrap_or(max));
+                let range = IntRange::<i32>::new(min, max);
+                if let Some(ideal) = r.ideal {
+                    let ideal = into_i32(ideal);
+                    let array = List::new(&[&ideal, &range]);
+                    Some(builder.field(name, &array))
                 } else {
-                    Some(format!("{}[{}, {}]",T::PREFIX, min, max))
+                    Some(builder.field(name, &range))
                 }
             }
         }
     }
 }
 
-trait Constrainable {
-    const PREFIX: &'static str;
-    fn into_caps_string(self) -> Option<String>;
-}
-
-impl Constrainable for u64 {
-    const PREFIX: &'static str = "";
-    fn into_caps_string(self) -> Option<String> {
-        Some(self.to_string())
+fn into_i32(x: u64) -> i32 {
+    if x > i32::MAX as u64 {
+        i32::MAX
+    } else {
+        x as i64 as i32
     }
 }
 
-
-impl Constrainable for f64 {
-    const PREFIX: &'static str = "(fraction) ";
-    fn into_caps_string(self) -> Option<String> {
-        let f = gst::Fraction::approximate_f64(self)?;
-        if self <= 0. {
-            None
-        } else {
-            Some(format!("{}/{}", f.0.numer(), f.0.denom()))
+impl Constrain<f64> {
+    fn add_to_caps(self, name: &str, min: i32, max: i32, builder: Builder) -> Option<Builder> {
+        match self {
+            Constrain::Value(v) => Some(builder.field("name", &Fraction::approximate_f64(v)?)),
+            Constrain::Range(r) => {
+                let min = r.min.and_then(|v| Fraction::approximate_f64(v)).unwrap_or(Fraction::new(min, 1));
+                let max = r.max.and_then(|v| Fraction::approximate_f64(v)).unwrap_or(Fraction::new(max, 1));
+                let range = FractionRange::new(min, max);
+                if let Some(ideal) = r.ideal.and_then(|v| Fraction::approximate_f64(v)) {
+                    let array = gst::List::new(&[&ideal, &range]);
+                    Some(builder.field(name, &array))
+                } else {
+                    Some(builder.field(name, &range))
+                }
+            }
         }
     }
 }
+
+
 
 struct ConstrainRange<T> {
     min: Option<T>,
@@ -95,31 +97,24 @@ struct MediaTrackConstraintSet {
 
 // TODO(Manishearth): Should support a set of constraints
 impl MediaTrackConstraintSet {
-    fn into_caps(self, format: &str) -> gst::Caps {
-        let mut caps: Vec<(&str, &dyn glib::ToSendValue)> = vec![];
-        // temp values for extending lifetimes of strings
-        let (tw, th, ta, tfr, tsr): (String, String, String, String, String);
-        if let Some(w) = self.width.and_then(|v| v.into_caps_string("0", "100000000000000")) {
-            tw = w;
-            caps.push(("width", &tw));
+    fn into_caps(self, format: &str) -> Option<gst::Caps> {
+        let mut builder = Caps::builder(format);
+        if let Some(w) = self.width {
+            builder = w.add_to_caps("width", 0, 1000000, builder)?;
         }
-        if let Some(h) = self.height.and_then(|v| v.into_caps_string("0", "100000000000000")) {
-            th = h;
-            caps.push(("height", &th));
+        if let Some(h) = self.height {
+            builder = h.add_to_caps("height", 0, 1000000, builder)?;
         }
-        if let Some(aspect) = self.aspect.and_then(|v| v.into_caps_string("0/1", "10000/1")) {
-            ta = aspect;
-            caps.push(("pixel-aspect-ratio", &ta));
+        if let Some(aspect) = self.aspect {
+            builder = aspect.add_to_caps("pixel-aspect-ratio", 0, 1000000, builder)?;
         }
-        if let Some(fr) = self.frame_rate.and_then(|v| v.into_caps_string("0/1", "10000000/1")) {
-            tfr = fr;
-            caps.push(("framerate", &tfr));
+        if let Some(fr) = self.frame_rate {
+            builder = fr.add_to_caps("framerate", 0, 1000000, builder)?;
         }
-        if let Some(sr) = self.sample_rate.and_then(|v| v.into_caps_string("0/1", "10000000/1")) {
-            tsr = sr;
-            caps.push(("rate", &tsr));
+        if let Some(sr) = self.sample_rate {
+            builder = sr.add_to_caps("rate", 0, 1000000, builder)?;
         }
-        gst::Caps::new_simple(format, &*caps)
+        Some(builder.build())
     }
 }
 
@@ -141,12 +136,13 @@ impl GstMediaDevices {
 
     fn get_track(&self, video: bool, constraints: MediaTrackConstraintSet) -> Option<GstMediaTrack> {
         let (format, filter) = if video { ("video/x-raw", "Video/Source") } else { ("audio/x-raw", "Audio/Source") };
-        let caps = constraints.into_caps(format);
-        println!("{:?}", caps);
+        let caps = constraints.into_caps(format)?;
+        println!("requesting {:?}", caps);
         let f = self.monitor.add_filter(filter, &caps);
         let devices = self.monitor.get_devices();
         self.monitor.remove_filter(f);
         if let Some(d) = devices.get(0) {
+            println!("{:?}", d.get_caps());
             let element = d.create_element(None)?;
             Some(GstMediaTrack {
                 element, video
@@ -197,9 +193,9 @@ fn main() {
     let main_loop = glib::MainLoop::new(None, false);
     let manager = GstMediaDevices::new();
     let av = manager.get_user_media(MediaStreamConstraints {
-        // video: Some(MediaTrackConstraintSet { width: Some(Constrain::Value(1000000000)), .. Default::default() }),
+        video: Some(MediaTrackConstraintSet { width: Some(Constrain::Range(ConstrainRange {min: Some(100), max: Some(1000), ideal: Some(800)})), .. Default::default() }),
         audio: Some(Default::default()),
-        video: Some(Default::default()),
+        // video: Some(Default::default()),
     });
     av.audio.map(|t| t.play());
     av.video.map(|t| t.play());
