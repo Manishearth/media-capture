@@ -93,6 +93,7 @@ struct MediaTrackConstraintSet {
     sample_rate: Option<Constrain<f64>>,
 }
 
+// TODO(Manishearth): Should support a set of constraints
 impl MediaTrackConstraintSet {
     fn into_caps(self, format: &str) -> gst::Caps {
         let mut caps: Vec<(&str, &dyn glib::ToSendValue)> = vec![];
@@ -122,43 +123,85 @@ impl MediaTrackConstraintSet {
     }
 }
 
+struct MediaStreamConstraints {
+    audio: Option<MediaTrackConstraintSet>,
+    video: Option<MediaTrackConstraintSet>,
+}
+
+struct GstMediaDevices {
+    monitor: DeviceMonitor,
+}
+
+impl GstMediaDevices {
+    pub fn new() -> Self {
+        Self {
+            monitor: DeviceMonitor::new()
+        }
+    }
+
+    fn get_track(&self, video: bool, constraints: MediaTrackConstraintSet) -> Option<GstMediaTrack> {
+        let (format, filter) = if video { ("video/x-raw", "Video/Source") } else { ("audio/x-raw", "Audio/Source") };
+        let caps = constraints.into_caps(format);
+        println!("{:?}", caps);
+        let f = self.monitor.add_filter(filter, &caps);
+        let devices = self.monitor.get_devices();
+        self.monitor.remove_filter(f);
+        if let Some(d) = devices.get(0) {
+            let element = d.create_element(None)?;
+            Some(GstMediaTrack {
+                element, video
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn get_user_media(&self, constraints: MediaStreamConstraints) -> GstMediaStream {
+        GstMediaStream {
+            video: constraints.video.and_then(|v| self.get_track(true, v)),
+            audio: constraints.audio.and_then(|a| self.get_track(false, a))
+        }
+    }
+}
+
+struct GstMediaStream {
+    video: Option<GstMediaTrack>,
+    audio: Option<GstMediaTrack>,
+}
+
+struct GstMediaTrack {
+    element: gst::Element,
+    video: bool,
+}
+
+impl GstMediaTrack {
+    fn play(&self) {
+        let pipeline = gst::Pipeline::new(None);
+        let (convert, sink) = if self.video {
+            let convert = gst::ElementFactory::make("videoconvert", None).unwrap();
+            let sink = gst::ElementFactory::make("autovideosink", None).unwrap();
+            (convert, sink)
+        } else {
+            let convert = gst::ElementFactory::make("audioconvert", None).unwrap();
+            let sink = gst::ElementFactory::make("autoaudiosink", None).unwrap();
+            (convert, sink)
+        };
+        pipeline.add_many(&[&self.element, &convert, &sink]);
+        gst::Element::link_many(&[&self.element, &convert, &sink]);
+        pipeline.set_state(gst::State::Playing);
+    }
+}
+
 fn main() {
     gstreamer::init();
     let main_loop = glib::MainLoop::new(None, false);
-    let mut monitor = DeviceMonitor::new();
-    let caps = gst::Caps::new_simple(
-        "audio/x-raw",
-        &[],
-    );
-
-
-    let audio = monitor.add_filter("Audio/Source", &caps);
-    let devices = monitor.get_devices();
-    let device = &devices[0];
-    println!("{:?}", device);
-    println!("{:?}", device.get_caps());
-    let element = device.create_element(None).unwrap();
-    let convert = gst::ElementFactory::make("audioconvert", None).unwrap();
-    let sink = gst::ElementFactory::make("autoaudiosink", None).unwrap();
-    let pipeline = gst::Pipeline::new(None);
-    pipeline.add_many(&[&element, &convert, &sink]);
-    gst::Element::link_many(&[&element, &convert, &sink]);
-
-    monitor.remove_filter(audio);
-    let caps = gst::Caps::new_simple(
-        "video/x-raw",
-        &[],
-    );
-    monitor.add_filter("Video/Source", &caps);
-
-    let devices = monitor.get_devices();
-    print!("{:#?}", devices[0].get_caps());
-    let element = devices[0].create_element(None).unwrap();
-
-    let convert = gst::ElementFactory::make("videoconvert", None).unwrap();
-    let sink = gst::ElementFactory::make("autovideosink", None).unwrap();
-    pipeline.add_many(&[&element, &convert, &sink]);
-    gst::Element::link_many(&[&element, &convert, &sink]);
-    pipeline.set_state(gst::State::Playing);
+    let manager = GstMediaDevices::new();
+    let av = manager.get_user_media(MediaStreamConstraints {
+        // video: Some(MediaTrackConstraintSet { width: Some(Constrain::Value(1000000000)), .. Default::default() }),
+        audio: Some(Default::default()),
+        video: Some(Default::default()),
+    });
+    av.audio.map(|t| t.play());
+    av.video.map(|t| t.play());
     main_loop.run();
 }
